@@ -5,6 +5,9 @@ Browse in Explorer, inspect sectors in a hex viewer, or export raw data.
 
 **Zero external dependencies** — just Python 3.8+ with wxWidgets.
 
+<img width="1888" height="1294" alt="image" src="https://github.com/user-attachments/assets/66978698-c0ee-419e-9f4d-cf26d6c9861c" />
+
+
 ## How It Works
 
 Image contents are extracted to a temp directory, then mapped to a drive letter. When you unmount, the

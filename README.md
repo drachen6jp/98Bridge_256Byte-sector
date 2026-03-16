@@ -3,7 +3,7 @@
 Mount NEC PC-98 floppy and hard disk images as native Windows drive letters.
 Browse in Explorer, inspect sectors in a hex viewer, or export raw data.
 
-**Zero external dependencies** — just Python 3.8+ with tkinter.
+**Zero external dependencies** — just Python 3.8+ with wxWidgets.
 
 ## How It Works
 

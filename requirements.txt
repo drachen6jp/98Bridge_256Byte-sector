@@ -1,0 +1,3 @@
+# No external dependencies required!
+# Python 3.8+ with tkinter is all you need.
+# Mounting uses the built-in Windows `subst` command.

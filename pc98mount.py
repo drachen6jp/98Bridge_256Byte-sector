@@ -15,6 +15,9 @@ Three mount modes:
 
 Also includes a built-in hex viewer for sector-level inspection.
 
+The **Update** button writes any modifications made through the file
+manager back into the disk image (overwrite or save-as).
+
 Usage:
     python pc98mount.py
     python pc98mount.py image.hdm
@@ -45,13 +48,6 @@ logging.basicConfig(
 log = logging.getLogger("pc98mount")
 
 def _build_wildcard():
-    """
-    Build a file-dialog wildcard string.
-    On Linux/GTK, file dialogs are case-sensitive, so the filter
-    includes both lower- and upper-case variants — but the display
-    label only shows lowercase to keep it clean.
-    On Windows the dialog is already case-insensitive.
-    """
     groups = [
         ("PC-98 Disk Images",
          ["d88", "d68", "d77", "hdm", "tfd", "fdi", "hdi", "img", "ima"]),
@@ -211,6 +207,15 @@ class PC98MountFrame(wx.Frame):
         btn_unmount.Bind(wx.EVT_BUTTON, self._on_unmount)
         tb_sizer.Add(btn_unmount, 0, wx.RIGHT, 4)
 
+        # ── NEW: Update button ───────────────────────────────────
+        btn_update = wx.Button(panel, label="Update image\u2026")
+        btn_update.SetToolTip(
+            "Write changes from the mounted directory back into "
+            "the disk image"
+        )
+        btn_update.Bind(wx.EVT_BUTTON, self._on_update)
+        tb_sizer.Add(btn_update, 0, wx.RIGHT, 4)
+
         tb_sizer.AddSpacer(16)
 
         browse_label = ("Open in Explorer" if is_windows()
@@ -360,7 +365,6 @@ class PC98MountFrame(wx.Frame):
                 self.target_combo.SetSelection(0)
 
     def _on_refresh_targets(self, event):
-        """Refresh the drive-letter list (Windows only)."""
         self._update_mount_targets()
         self._set_status("Drive letters refreshed.")
 
@@ -593,12 +597,11 @@ class PC98MountFrame(wx.Frame):
                 "No FAT", wx.OK | wx.ICON_WARNING)
             return
 
-        # --- Show busy message while mounting ---
         self._set_status(
             f"Mounting {Path(info.path).name} at {target} ({mode})\u2026")
 
         busy = wx.BusyInfo("Please wait, mounting in progress\u2026")
-        wx.GetApp().Yield()  # let the busy overlay paint
+        wx.GetApp().Yield()
 
         try:
             image_size = info.disk.total_sectors * info.disk.sector_size
@@ -611,7 +614,6 @@ class PC98MountFrame(wx.Frame):
             info.mount_id = target
             info.mount_mode = mode
 
-            # Update listbox
             idx = self.image_listbox.GetSelection()
             if idx != wx.NOT_FOUND:
                 disp = self._mount_display(info)
@@ -638,7 +640,6 @@ class PC98MountFrame(wx.Frame):
                 f"Mounted at {location}{via} \u2014 "
                 f"{mode_desc.get(mode, mode)}")
 
-            # Check for empty FAT extraction
             if mode == "fat" and mount_obj:
                 count = getattr(mount_obj, '_extract_count', -1)
                 errors = getattr(mount_obj, '_extract_errors', 0)
@@ -664,7 +665,7 @@ class PC98MountFrame(wx.Frame):
                           "Mount Error", wx.OK | wx.ICON_ERROR)
             self._set_status(f"Mount failed: {e}")
         finally:
-            del busy  # dismiss the busy overlay
+            del busy
 
     def _on_unmount(self, event):
         info = self._selected_image()
@@ -690,6 +691,106 @@ class PC98MountFrame(wx.Frame):
         self._populate_detail(info)
         self._update_mount_targets()
         self._set_status(f"Unmounted {mid}")
+
+    # ── Update (write-back) ──────────────────────────────────────────
+
+    def _on_update(self, event):
+        """Write modifications from the mount point back into the
+        disk image, offering "Overwrite" / "Save As" / "Cancel"."""
+        info = self._selected_image()
+        if not info:
+            wx.MessageBox("Select a disk image first.",
+                          "No Image", wx.OK | wx.ICON_INFORMATION)
+            return
+
+        if (not info.mount_id
+                or not self.mount_mgr.is_mounted(info.mount_id)):
+            wx.MessageBox(
+                "This image is not currently mounted.\n"
+                "Mount it first, make your changes in the file "
+                "manager, then click Update.",
+                "Not Mounted", wx.OK | wx.ICON_INFORMATION)
+            return
+
+        # --- Confirmation dialog with three choices ---
+        dlg = wx.MessageDialog(
+            self,
+            f"Write changes back to the disk image?\n\n"
+            f"Image:  {Path(info.path).name}\n"
+            f"Mode:   {info.mount_mode}\n\n"
+            f"\"Yes\" overwrites the original file.\n"
+            f"\"No\" lets you choose a new file (Save As).\n"
+            f"\"Cancel\" does nothing.",
+            "Update Disk Image",
+            wx.YES_NO | wx.CANCEL | wx.ICON_QUESTION
+        )
+        dlg.SetYesNoLabels("Overwrite Original", "Save As\u2026")
+        dlg.CentreOnParent()
+        choice = dlg.ShowModal()
+        dlg.Destroy()
+
+        if choice == wx.ID_CANCEL:
+            return
+
+        save_path = None  # None means overwrite original
+
+        if choice == wx.ID_NO:
+            # "Save As" was clicked.
+            wildcard = "All Files (*.*)|*.*"
+            default_name = Path(info.path).name
+            save_dlg = wx.FileDialog(
+                self, "Save Image As",
+                defaultDir=str(Path(info.path).parent),
+                defaultFile=default_name,
+                style=wx.FD_SAVE | wx.FD_OVERWRITE_PROMPT,
+                wildcard=wildcard,
+            )
+            save_dlg.CentreOnParent()
+            if save_dlg.ShowModal() != wx.ID_OK:
+                save_dlg.Destroy()
+                return
+            save_path = save_dlg.GetPath()
+            save_dlg.Destroy()
+
+        # --- Perform the write-back ---
+        self._set_status("Writing changes back to image\u2026")
+        busy = wx.BusyInfo(
+            "Please wait, writing changes to disk image\u2026")
+        wx.GetApp().Yield()
+
+        try:
+            result = self.mount_mgr.update(
+                info.mount_id,
+                info.mount_mode,
+                disk_image=info.disk,
+                fat_fs=info.fs,
+                save_path=save_path,
+            )
+            self._set_status(result)
+
+            # Refresh the tree and detail panels so the user sees the
+            # new state (the FAT writer reloads the in-memory FS).
+            self._populate_tree(info)
+            self._populate_detail(info)
+
+            dest = save_path or info.path
+            wx.MessageBox(
+                f"Update complete.\n\n{result}\n\n"
+                f"Saved to:\n{dest}",
+                "Update Successful",
+                wx.OK | wx.ICON_INFORMATION,
+            )
+
+        except Exception as e:
+            log.exception("Update failed")
+            wx.MessageBox(
+                f"Failed to write changes back:\n\n{e}",
+                "Update Error", wx.OK | wx.ICON_ERROR)
+            self._set_status(f"Update failed: {e}")
+        finally:
+            del busy
+
+    # ── Open in file manager ─────────────────────────────────────────
 
     def _on_open_file_manager(self, event):
         info = self._selected_image()

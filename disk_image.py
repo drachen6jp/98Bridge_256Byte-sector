@@ -2,9 +2,17 @@
 PC-98 Disk Image Format Parsers
 Supports: D88/D68, HDM, FDI, HDI, and raw sector images.
 Provides uniform sector-level access regardless of container format.
+
+Write support: each format implements write_sector() and save() so that
+modifications can be flushed back to disk.
 """
 
 import struct
+import os
+import shutil
+import logging
+
+log = logging.getLogger("pc98mount.disk")
 
 
 class DiskImage:
@@ -13,7 +21,7 @@ class DiskImage:
     def __init__(self, path):
         self.path = path
         with open(path, 'rb') as f:
-            self._data = f.read()
+            self._data = bytearray(f.read())
         self._parse()
 
     def _parse(self):
@@ -39,6 +47,40 @@ class DiskImage:
         for i in range(count):
             data.extend(self.read_sector(lba + i))
         return bytes(data)
+
+    # ── Write support ────────────────────────────────────────────────
+
+    def write_sector(self, lba, data):
+        """Write one sector. *data* must be at least sector_size bytes."""
+        raise NotImplementedError
+
+    def save(self, path=None):
+        """Flush the in-memory image to disk.
+
+        If *path* is given the image is written there (the original is
+        untouched).  Otherwise the original file is overwritten via an
+        atomic write-to-temp-then-rename pattern.
+        """
+        save_path = path or self.path
+        if save_path == self.path:
+            # Atomic overwrite: write next to the original, then rename.
+            tmp = save_path + '.tmp'
+            try:
+                with open(tmp, 'wb') as f:
+                    f.write(self._data)
+                # On Windows, os.replace is atomic if on the same volume.
+                shutil.move(tmp, save_path)
+            except Exception:
+                # Clean up partial write.
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+        else:
+            with open(save_path, 'wb') as f:
+                f.write(self._data)
+        log.info(f"Saved image ({len(self._data):,} bytes) to {save_path}")
 
 
 class RawImage(DiskImage):
@@ -79,7 +121,14 @@ class RawImage(DiskImage):
         offset = lba * self._sector_size
         if offset + self._sector_size > len(self._data):
             return b'\x00' * self._sector_size
-        return self._data[offset:offset + self._sector_size]
+        return bytes(self._data[offset:offset + self._sector_size])
+
+    def write_sector(self, lba, data):
+        offset = lba * self._sector_size
+        end = offset + self._sector_size
+        if end > len(self._data):
+            raise IndexError(f"Sector {lba} out of range")
+        self._data[offset:end] = data[:self._sector_size]
 
 
 class FDIImage(DiskImage):
@@ -94,14 +143,6 @@ class FDIImage(DiskImage):
         if len(self._data) < self.HEADER_SIZE:
             raise ValueError("File too small for FDI format")
 
-        # FDI header layout (little-endian):
-        # 0x00: uint32 - fdd_type
-        # 0x04: uint32 - header_size (should be 4096)
-        # 0x08: uint32 - sector_size (bytes per sector)
-        # 0x0C: uint32 - sectors per cylinder? (varies by implementation)
-        # 0x10: uint32 - sectors per track
-        # 0x14: uint32 - heads (surfaces)
-        # 0x18: uint32 - cylinders (tracks)
         fdd_type, hdr_size, sec_size = struct.unpack_from('<III', self._data, 0)
         spt, heads, cyls = struct.unpack_from('<III', self._data, 0x10)
 
@@ -118,7 +159,14 @@ class FDIImage(DiskImage):
         offset = self._raw_offset + lba * self._sector_size
         if offset + self._sector_size > len(self._data):
             return b'\x00' * self._sector_size
-        return self._data[offset:offset + self._sector_size]
+        return bytes(self._data[offset:offset + self._sector_size])
+
+    def write_sector(self, lba, data):
+        offset = self._raw_offset + lba * self._sector_size
+        end = offset + self._sector_size
+        if end > len(self._data):
+            raise IndexError(f"Sector {lba} out of range")
+        self._data[offset:end] = data[:self._sector_size]
 
 
 class D88Image(DiskImage):
@@ -150,7 +198,7 @@ class D88Image(DiskImage):
             self._track_offsets.append(off)
 
         # Build a flat sector table by walking all tracks
-        self._sectors = []  # list of (offset_in_file, size) for each logical sector
+        self._sectors = []  # list of (offset_in_file, size)
         self._sector_size = 0
 
         for track_off in self._track_offsets:
@@ -160,10 +208,7 @@ class D88Image(DiskImage):
             if pos >= len(self._data):
                 continue
 
-            # Read sectors in this track
             while pos < len(self._data) - 16:
-                # D88 sector header: C(1) H(1) R(1) N(1) num_sectors(2)
-                # density(1) deleted(1) status(1) reserved(5) data_size(2)
                 c, h, r, n = struct.unpack_from('BBBB', self._data, pos)
                 num_sects = struct.unpack_from('<H', self._data, pos + 4)[0]
                 data_size = struct.unpack_from('<H', self._data, pos + 14)[0]
@@ -180,9 +225,7 @@ class D88Image(DiskImage):
 
                 pos = data_offset + data_size
 
-                # Stop if we've read all sectors for this track
                 if len(self._sectors) % num_sects == 0 and num_sects > 0:
-                    # Check if next sector header belongs to a different track
                     if pos + 16 <= len(self._data):
                         next_c = self._data[pos]
                         next_h = self._data[pos + 1]
@@ -200,16 +243,24 @@ class D88Image(DiskImage):
             return b'\x00' * self._sector_size
         offset, size = self._sectors[lba]
         data = self._data[offset:offset + size]
-        # Pad or truncate to uniform sector size
         if len(data) < self._sector_size:
             data = data + b'\x00' * (self._sector_size - len(data))
-        return data[:self._sector_size]
+        return bytes(data[:self._sector_size])
+
+    def write_sector(self, lba, data):
+        if lba < 0 or lba >= len(self._sectors):
+            raise IndexError(f"Sector {lba} out of range")
+        offset, size = self._sectors[lba]
+        # Write into the data portion, padded/truncated to stored size.
+        write_data = bytearray(data[:size])
+        if len(write_data) < size:
+            write_data.extend(b'\x00' * (size - len(write_data)))
+        self._data[offset:offset + size] = write_data
 
 
 class HDIImage(DiskImage):
     """
     HDI image format — hard disk image with a small header.
-    Header: 4096 bytes (commonly), followed by raw sector data.
     Used by Anex86 and some other emulators.
     """
 
@@ -217,14 +268,6 @@ class HDIImage(DiskImage):
         if len(self._data) < 4096:
             raise ValueError("File too small for HDI format")
 
-        # HDI header (Anex86 format):
-        # 0x00: uint32 - reserved/padding flag
-        # 0x04: uint32 - header size
-        # 0x08: uint32 - total data size
-        # 0x0C: uint32 - sector size
-        # 0x10: uint32 - sectors
-        # 0x14: uint32 - heads
-        # 0x18: uint32 - cylinders
         hdr_size = struct.unpack_from('<I', self._data, 0x04)[0]
         data_size = struct.unpack_from('<I', self._data, 0x08)[0]
         sec_size = struct.unpack_from('<I', self._data, 0x0C)[0]
@@ -233,7 +276,7 @@ class HDIImage(DiskImage):
         cyls = struct.unpack_from('<I', self._data, 0x18)[0]
 
         if sec_size not in (128, 256, 512, 1024, 2048, 4096):
-            sec_size = 512  # HDI often uses 512-byte sectors for HDD
+            sec_size = 512
         if hdr_size == 0 or hdr_size > 0x10000:
             hdr_size = 4096
 
@@ -247,7 +290,14 @@ class HDIImage(DiskImage):
         offset = self._raw_offset + lba * self._sector_size
         if offset + self._sector_size > len(self._data):
             return b'\x00' * self._sector_size
-        return self._data[offset:offset + self._sector_size]
+        return bytes(self._data[offset:offset + self._sector_size])
+
+    def write_sector(self, lba, data):
+        offset = self._raw_offset + lba * self._sector_size
+        end = offset + self._sector_size
+        if end > len(self._data):
+            raise IndexError(f"Sector {lba} out of range")
+        self._data[offset:end] = data[:self._sector_size]
 
 
 def open_image(path):
@@ -264,11 +314,6 @@ def open_image(path):
     elif ext.endswith('.hdm') or ext.endswith('.tfd'):
         return RawImage(path, sector_size=1024)
     elif ext.endswith('.img') or ext.endswith('.ima'):
-        # Heuristic: check size
         return RawImage(path)
     else:
-        # Try raw with auto-detect
         return RawImage(path)
-
-
-import os

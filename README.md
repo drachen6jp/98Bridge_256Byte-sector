@@ -1,16 +1,14 @@
 # PC-98 Disk Image Mounter
 
-Mount NEC PC-98 floppy and hard disk images as native mount points / Windows drive letters.
+Mount NEC PC-98 floppy and hard disk images as native Windows drive letters.
 Browse in Explorer, inspect sectors in a hex viewer, or export raw data.
 
-**Zero external dependencies** — just Python 3.8+ with wxWidgets.
-
-<img width="1888" height="1294" alt="image" src="https://github.com/user-attachments/assets/66978698-c0ee-419e-9f4d-cf26d6c9861c" />
-
+**Zero external dependencies** — just Python 3.8+ with tkinter.
 
 ## How It Works
 
-Image contents are extracted to a temp directory, then mapped to a drive letter. When you unmount, the
+Mounting uses Windows' built-in `subst` command: image contents are extracted
+to a temp directory, then mapped to a drive letter. When you unmount, the
 temp directory is cleaned up. The original image is never modified.
 
 ## Supported Formats

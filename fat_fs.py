@@ -6,8 +6,13 @@ native sector size (e.g., BPB says 1024 but a D88 image exposes 4096-byte
 logical sectors). All filesystem reads go through _read_fs_bytes() which
 translates BPB byte offsets into disk sector reads, making it work
 regardless of how the disk image is sliced.
+
+Write-back support: write_back_from_directory() rebuilds the FAT, root
+directory, and data area from a real directory on the host filesystem,
+then saves the result through the disk image's write_sector()/save() API.
 """
 
+import os
 import struct
 import logging
 from datetime import datetime
@@ -30,7 +35,6 @@ ATTR_ARCHIVE   = 0x20
 ATTR_LFN       = 0x0F
 
 # Known PC-98 floppy geometries:
-# (image_bytes, bps, spc, reserved, nfats, root_entries, fat_sectors, total_sectors, media)
 PC98_KNOWN_GEOMETRIES = [
     (1261568, 1024, 1, 1, 2, 192, 2, 1232, 0xFE),   # 2HD 1.2MB (most common)
     (1228800, 1024, 1, 1, 2, 192, 2, 1200, 0xFE),   # 2HD variant
@@ -118,37 +122,55 @@ class FATFilesystem:
     # ── Byte-level read layer ────────────────────────────────────────
 
     def _read_fs_bytes(self, byte_offset, byte_length):
-        """
-        Read `byte_length` bytes starting at `byte_offset` in the image.
-        Translates to disk sector reads regardless of the disk's native
-        sector size.
-        """
         if byte_length == 0:
             return b''
-
         ds = self.disk.sector_size
         first_disk_sector = byte_offset // ds
         last_disk_sector = (byte_offset + byte_length - 1) // ds
         count = last_disk_sector - first_disk_sector + 1
-
         raw = self.disk.read_sectors(first_disk_sector, count)
-
         local_start = byte_offset % ds
         return raw[local_start:local_start + byte_length]
 
     def _read_fs_sectors(self, fs_sector, count):
-        """
-        Read `count` filesystem sectors (at self.bytes_per_sector size)
-        starting at filesystem sector number `fs_sector`.
-        """
         byte_offset = fs_sector * self.bytes_per_sector
         byte_length = count * self.bytes_per_sector
         return self._read_fs_bytes(byte_offset, byte_length)
 
+    # ── Byte-level write layer ───────────────────────────────────────
+
+    def _write_fs_bytes(self, byte_offset, data):
+        """Write *data* at *byte_offset* in the image, handling sector
+        boundaries and partial-sector writes transparently."""
+        if not data:
+            return
+        ds = self.disk.sector_size
+        pos = 0
+        while pos < len(data):
+            current_byte = byte_offset + pos
+            sector_num = current_byte // ds
+            sector_off = current_byte % ds
+            can_write = min(ds - sector_off, len(data) - pos)
+
+            if sector_off == 0 and can_write == ds:
+                # Full-sector write — no read needed.
+                self.disk.write_sector(sector_num, data[pos:pos + ds])
+            else:
+                # Partial sector: read-modify-write.
+                sector_data = bytearray(self.disk.read_sector(sector_num))
+                sector_data[sector_off:sector_off + can_write] = (
+                    data[pos:pos + can_write]
+                )
+                self.disk.write_sector(sector_num, bytes(sector_data))
+            pos += can_write
+
+    def _write_fs_sectors(self, fs_sector, data):
+        """Write *data* starting at filesystem sector *fs_sector*."""
+        self._write_fs_bytes(fs_sector * self.bytes_per_sector, data)
+
     # ── BPB parsing with validation ──────────────────────────────────
 
     def _bpb_is_sane(self, bps, spc, reserved, nfats, root_ents, fat_sz, total):
-        """Check if a set of BPB values makes sense."""
         if bps not in (128, 256, 512, 1024, 2048, 4096):
             return False
         if spc == 0 or spc > 128 or (spc & (spc - 1)) != 0:
@@ -163,26 +185,17 @@ class FATFilesystem:
             return False
         if total == 0:
             return False
-
-        # Layout must fit within image
         root_dir_sects = (root_ents * 32 + bps - 1) // bps
         first_data = reserved + nfats * fat_sz + root_dir_sects
         if first_data >= total:
             return False
-
-        # Compare total BYTES not sector counts (sector sizes may differ)
         bpb_bytes = total * bps
         if bpb_bytes > self._image_total_bytes * 2:
             return False
-
         return True
 
     def _parse_bpb(self):
-        """Parse BPB with validation, falling back to known geometries."""
-        # Read the first 512 or 1024 bytes (boot sector)
         boot = self._read_fs_bytes(0, min(1024, self._image_total_bytes))
-
-        # Read standard BPB fields
         bps = struct.unpack_from('<H', boot, 0x0B)[0]
         spc = boot[0x0D]
         reserved = struct.unpack_from('<H', boot, 0x0E)[0]
@@ -191,7 +204,6 @@ class FATFilesystem:
         total16 = struct.unpack_from('<H', boot, 0x13)[0]
         media = boot[0x15]
         fat_sz = struct.unpack_from('<H', boot, 0x16)[0]
-
         total = total16
         if total == 0 and len(boot) >= 0x24:
             total = struct.unpack_from('<I', boot, 0x20)[0]
@@ -219,7 +231,6 @@ class FATFilesystem:
             log.warning("BPB invalid, trying known PC-98 geometries")
             self._apply_geometry_fallback()
 
-        # Extra BPB fields (informational)
         try:
             self.sectors_per_track = struct.unpack_from('<H', boot, 0x18)[0]
             self.num_heads = struct.unpack_from('<H', boot, 0x1A)[0]
@@ -235,10 +246,11 @@ class FATFilesystem:
             // self.bytes_per_sector
         )
         self.first_fat_sector = self.reserved_sectors
-        self.first_root_sector = self.first_fat_sector + self.num_fats * self.fat_size_16
+        self.first_root_sector = (
+            self.first_fat_sector + self.num_fats * self.fat_size_16
+        )
         self.first_data_sector = self.first_root_sector + self.root_dir_sectors
 
-        # FAT type
         data_sectors = self.total_sectors - self.first_data_sector
         if data_sectors > 0 and self.sectors_per_cluster > 0:
             self.total_clusters = data_sectors // self.sectors_per_cluster
@@ -246,12 +258,11 @@ class FATFilesystem:
             self.total_clusters = 0
         self.fat_type = 12 if self.total_clusters < 4085 else 16
 
-        # Volume label
         self.volume_label = ""
         try:
             self.volume_label = boot[0x2B:0x36].decode(
                 'shift_jis', errors='replace'
-            ).rstrip()
+            ).rstrip().rstrip('\x00')
         except Exception:
             pass
 
@@ -264,11 +275,9 @@ class FATFilesystem:
             f"{self.total_clusters} clusters"
         )
 
-        # Validate FAT header
         self._validate_fat_header()
 
     def _apply_geometry_fallback(self):
-        """Apply a known PC-98 geometry based on image size."""
         matched = False
         for (geo_bytes, geo_bps, geo_spc, geo_res, geo_nfats,
              geo_root, geo_fat, geo_total, geo_media) in PC98_KNOWN_GEOMETRIES:
@@ -290,7 +299,6 @@ class FATFilesystem:
 
         if not matched:
             log.warning("No geometry match — using default PC-98 2HD layout")
-            # Default: assume 1024-byte sectors
             bps = 1024 if self._image_total_bytes % 1024 == 0 else 512
             self.bytes_per_sector = bps
             self.sectors_per_cluster = 1
@@ -302,7 +310,6 @@ class FATFilesystem:
             self.total_sectors = self._image_total_bytes // bps
 
     def _validate_fat_header(self):
-        """Check that the FAT table starts with a valid media descriptor."""
         try:
             fat_data = self._read_fs_sectors(self.first_fat_sector, 1)
             first_byte = fat_data[0]
@@ -360,7 +367,6 @@ class FATFilesystem:
         return chain
 
     def cluster_to_fs_sector(self, cluster):
-        """Convert cluster number to filesystem sector number."""
         return self.first_data_sector + (cluster - 2) * self.sectors_per_cluster
 
     def read_cluster(self, cluster):
@@ -496,3 +502,357 @@ class FATFilesystem:
             yield full, e
             if e.is_directory:
                 yield from self.walk(full, full)
+
+    # =================================================================
+    #  FAT WRITE-BACK
+    # =================================================================
+
+    @staticmethod
+    def _filename_to_83(filename, is_dir=False):
+        """Convert a host filename to an (name8, ext3) pair of bytes.
+
+        Names are upper-cased and padded with spaces.  Characters that
+        are illegal in 8.3 are replaced with underscores.
+        """
+        # Characters forbidden in 8.3 names (plus space).
+        _INVALID = set(' "+,./;:<=>?[\\]|*')
+
+        def _clean(s):
+            out = []
+            for ch in s:
+                if ord(ch) < 0x20 or ch in _INVALID:
+                    out.append('_')
+                else:
+                    out.append(ch)
+            return ''.join(out)
+
+        if is_dir:
+            name = _clean(filename.upper())[:8]
+            return name.ljust(8).encode('ascii', errors='replace'), \
+                   b'   '
+
+        # Split on the *last* dot.
+        if '.' in filename:
+            base, ext = filename.rsplit('.', 1)
+        else:
+            base, ext = filename, ''
+
+        base = _clean(base.upper())[:8]
+        ext  = _clean(ext.upper())[:3]
+
+        return base.ljust(8).encode('ascii', errors='replace'), \
+               ext.ljust(3).encode('ascii', errors='replace')
+
+    @staticmethod
+    def _unique_83(name8, ext3, used_names):
+        """If *name8*+*ext3* already exists in *used_names*, mangle the
+        base with a ``~N`` tail until it's unique.  Returns the
+        (possibly mangled) pair and adds it to *used_names*.
+        """
+        key = name8 + ext3
+        if key not in used_names:
+            used_names.add(key)
+            return name8, ext3
+
+        base = name8.rstrip(b' ')
+        for n in range(1, 1000):
+            suffix = f"~{n}".encode('ascii')
+            max_base = 8 - len(suffix)
+            mangled = base[:max_base] + suffix
+            mangled = mangled.ljust(8)
+            key = mangled + ext3
+            if key not in used_names:
+                used_names.add(key)
+                return mangled, ext3
+        raise RuntimeError("Cannot generate unique 8.3 name")
+
+    @staticmethod
+    def _make_dir_entry(name8: bytes, ext3: bytes, attr, cluster,
+                        size, mtime):
+        """Build one 32-byte FAT directory entry."""
+        entry = bytearray(32)
+        entry[0:8] = name8[:8]
+        entry[8:11] = ext3[:3]
+        entry[11] = attr
+
+        if isinstance(mtime, datetime):
+            fat_time = ((mtime.hour & 0x1F) << 11 |
+                        (mtime.minute & 0x3F) << 5 |
+                        (mtime.second // 2) & 0x1F)
+            fat_date = (((mtime.year - 1980) & 0x7F) << 9 |
+                        (mtime.month & 0x0F) << 5 |
+                        (mtime.day & 0x1F))
+        else:
+            fat_time = 0
+            fat_date = 0x0021  # 1980-01-01
+
+        struct.pack_into('<H', entry, 22, fat_time)
+        struct.pack_into('<H', entry, 24, fat_date)
+        struct.pack_into('<H', entry, 26, cluster & 0xFFFF)
+        struct.pack_into('<I', entry, 28, size & 0xFFFFFFFF)
+        return bytes(entry)
+
+    def _build_fat_bytes(self, fat_table):
+        """Serialise the in-memory *fat_table* list to on-disk bytes."""
+        fat_bytes_len = self.fat_size_16 * self.bytes_per_sector
+        buf = bytearray(fat_bytes_len)
+
+        if self.fat_type == 12:
+            for i, val in enumerate(fat_table):
+                offset = i + (i // 2)
+                if offset + 1 >= len(buf):
+                    break
+                word = struct.unpack_from('<H', buf, offset)[0]
+                if i & 1:
+                    word = (word & 0x000F) | ((val & 0x0FFF) << 4)
+                else:
+                    word = (word & 0xF000) | (val & 0x0FFF)
+                struct.pack_into('<H', buf, offset, word)
+        else:
+            for i, val in enumerate(fat_table):
+                offset = i * 2
+                if offset + 1 >= len(buf):
+                    break
+                struct.pack_into('<H', buf, offset, val & 0xFFFF)
+
+        return bytes(buf)
+
+    # ── Cluster allocator helpers (used only during write-back) ──────
+
+    @staticmethod
+    def _alloc_cluster(fat, next_free):
+        """Allocate one free cluster, advancing *next_free* (a 1-element
+        list used as a mutable counter).  Raises RuntimeError if full."""
+        while next_free[0] < len(fat):
+            if fat[next_free[0]] == 0:
+                c = next_free[0]
+                next_free[0] += 1
+                return c
+            next_free[0] += 1
+        raise RuntimeError("Disk full — not enough free clusters")
+
+    def _alloc_chain(self, fat, next_free, num_clusters):
+        """Allocate a chain of *num_clusters* and link them in *fat*.
+        Returns the list of cluster numbers."""
+        eoc = 0xFFF if self.fat_type == 12 else 0xFFFF
+        chain = []
+        for _ in range(num_clusters):
+            chain.append(self._alloc_cluster(fat, next_free))
+        for i in range(len(chain) - 1):
+            fat[chain[i]] = chain[i + 1]
+        if chain:
+            fat[chain[-1]] = eoc
+        return chain
+
+    def _write_to_clusters(self, chain, data, cluster_size):
+        """Write *data* into the given cluster *chain*."""
+        for i, cluster in enumerate(chain):
+            offset = i * cluster_size
+            chunk = data[offset:offset + cluster_size]
+            if len(chunk) < cluster_size:
+                chunk = chunk + b'\x00' * (cluster_size - len(chunk))
+            fs_sector = self.cluster_to_fs_sector(cluster)
+            self._write_fs_bytes(fs_sector * self.bytes_per_sector, chunk)
+
+    # ── The main write-back entry point ──────────────────────────────
+
+    def write_back_from_directory(self, dir_path, save_path=None):
+        """Rebuild the FAT filesystem from the real directory at
+        *dir_path*, then save the image.
+
+        * The boot sector / BPB is left untouched.
+        * The FAT tables, root directory, and data area are rebuilt from
+          scratch based on the files currently present under *dir_path*.
+        * If *save_path* is given the image is saved there; otherwise
+          the original file is overwritten.
+
+        Returns a ``(files_written, dirs_written)`` tuple.
+        """
+        cluster_size = self.sectors_per_cluster * self.bytes_per_sector
+        max_cluster = self.total_clusters + 2
+
+        # 1. Initialise in-memory FAT.
+        fat = [0] * max_cluster
+        if self.fat_type == 12:
+            fat[0] = 0xF00 | (self.media_descriptor & 0xFF)
+            fat[1] = 0xFFF
+        else:
+            fat[0] = 0xFF00 | (self.media_descriptor & 0xFF)
+            fat[1] = 0xFFFF
+        next_free = [2]
+
+        # 2. Zero out root directory area.
+        root_byte_off = self.first_root_sector * self.bytes_per_sector
+        root_byte_len = self.root_dir_sectors * self.bytes_per_sector
+        self._write_fs_bytes(root_byte_off, b'\x00' * root_byte_len)
+
+        # 3. Zero out data area.
+        data_byte_off = self.first_data_sector * self.bytes_per_sector
+        data_byte_len = (
+            (self.total_sectors - self.first_data_sector) *
+            self.bytes_per_sector
+        )
+        if data_byte_len > 0:
+            # Write in 64 KB chunks to keep memory reasonable.
+            CHUNK = 65536
+            written = 0
+            while written < data_byte_len:
+                n = min(CHUNK, data_byte_len - written)
+                self._write_fs_bytes(data_byte_off + written, b'\x00' * n)
+                written += n
+
+        # 4. Walk host directory and write contents.
+        counters = {'files': 0, 'dirs': 0}
+
+        def _process_dir(real_path, parent_cluster, is_root):
+            """Process one real directory level.  Returns a list of
+            32-byte entry blocks ready to write into a directory area."""
+            entries = []
+            used_names = set()
+
+            try:
+                items = sorted(os.listdir(real_path))
+            except OSError as exc:
+                log.warning(f"Cannot list {real_path}: {exc}")
+                return entries
+
+            for item_name in items:
+                item_path = os.path.join(real_path, item_name)
+
+                try:
+                    mtime = datetime.fromtimestamp(
+                        os.path.getmtime(item_path))
+                except OSError:
+                    mtime = datetime(1980, 1, 1)
+
+                if os.path.isdir(item_path):
+                    # ── Subdirectory ─────────────────────────────────
+                    name8, ext3 = self._filename_to_83(item_name,
+                                                       is_dir=True)
+                    name8, ext3 = self._unique_83(name8, ext3,
+                                                   used_names)
+
+                    # Pre-allocate one cluster (expand later if needed).
+                    eoc = 0xFFF if self.fat_type == 12 else 0xFFFF
+                    dir_cluster = self._alloc_cluster(fat, next_free)
+                    fat[dir_cluster] = eoc
+
+                    # Recurse to get child entries.
+                    child_entries = _process_dir(
+                        item_path, dir_cluster, False)
+
+                    # Build the on-disk directory data: . , .. , children.
+                    dot = self._make_dir_entry(
+                        b'.       ', b'   ', ATTR_DIRECTORY,
+                        dir_cluster, 0, mtime)
+                    dotdot = self._make_dir_entry(
+                        b'..      ', b'   ', ATTR_DIRECTORY,
+                        parent_cluster if not is_root else 0, 0, mtime)
+
+                    dir_data = bytearray(dot + dotdot)
+                    for ce in child_entries:
+                        dir_data.extend(ce)
+
+                    # Pad to cluster boundary.
+                    remainder = len(dir_data) % cluster_size
+                    if remainder:
+                        dir_data.extend(
+                            b'\x00' * (cluster_size - remainder))
+
+                    # Allocate more clusters if the directory grew.
+                    num_cl = len(dir_data) // cluster_size
+                    chain = [dir_cluster]
+                    for _ in range(num_cl - 1):
+                        c = self._alloc_cluster(fat, next_free)
+                        fat[chain[-1]] = c
+                        fat[c] = eoc
+                        chain.append(c)
+
+                    self._write_to_clusters(chain, bytes(dir_data),
+                                            cluster_size)
+
+                    entry = self._make_dir_entry(
+                        name8, ext3, ATTR_DIRECTORY,
+                        dir_cluster, 0, mtime)
+                    entries.append(entry)
+                    counters['dirs'] += 1
+
+                elif os.path.isfile(item_path):
+                    # ── Regular file ─────────────────────────────────
+                    name8, ext3 = self._filename_to_83(item_name)
+                    name8, ext3 = self._unique_83(name8, ext3,
+                                                   used_names)
+                    try:
+                        with open(item_path, 'rb') as fh:
+                            file_data = fh.read()
+                    except OSError as exc:
+                        log.warning(
+                            f"Cannot read {item_path}: {exc}")
+                        continue
+
+                    file_size = len(file_data)
+                    if file_size > 0:
+                        num_cl = (
+                            (file_size + cluster_size - 1) //
+                            cluster_size
+                        )
+                        chain = self._alloc_chain(
+                            fat, next_free, num_cl)
+                        self._write_to_clusters(
+                            chain, file_data, cluster_size)
+                        first_cluster = chain[0]
+                    else:
+                        first_cluster = 0
+
+                    entry = self._make_dir_entry(
+                        name8, ext3, ATTR_ARCHIVE,
+                        first_cluster, file_size, mtime)
+                    entries.append(entry)
+                    counters['files'] += 1
+
+            return entries
+
+        root_entries = _process_dir(dir_path, 0, True)
+
+        # 5. Write volume label back into the root directory if we had one.
+        vol_entries = []
+        vol_clean = (self.volume_label or '').strip().strip('\x00')
+        if vol_clean:
+            vol_name = vol_clean.upper()[:11].ljust(11)
+            vol_entry = self._make_dir_entry(
+                vol_name[:8].encode('ascii', errors='replace'),
+                vol_name[8:11].encode('ascii', errors='replace'),
+                ATTR_VOLUME_ID, 0, 0, datetime.now())
+            vol_entries.append(vol_entry)
+
+        # Combine and check root-directory capacity.
+        all_root = vol_entries + root_entries
+        max_root_bytes = self.root_entry_count * 32
+        root_data = b''.join(all_root)
+        if len(root_data) > max_root_bytes:
+            raise RuntimeError(
+                f"Root directory overflow: {len(all_root)} entries, "
+                f"max {self.root_entry_count}"
+            )
+        self._write_fs_bytes(root_byte_off, root_data)
+
+        # 6. Write FAT tables (all copies).
+        fat_data = self._build_fat_bytes(fat)
+        for i in range(self.num_fats):
+            fat_sector = self.first_fat_sector + i * self.fat_size_16
+            self._write_fs_bytes(
+                fat_sector * self.bytes_per_sector, fat_data)
+
+        # 7. Save image file.
+        self.disk.save(save_path)
+
+        # 8. Reload in-memory FAT and directory tree so subsequent
+        #    reads reflect the new state.
+        self._load_fat()
+        self._build_root()
+
+        log.info(
+            f"Write-back complete: {counters['files']} files, "
+            f"{counters['dirs']} directories"
+        )
+        return counters['files'], counters['dirs']

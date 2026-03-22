@@ -25,7 +25,6 @@ Usage:
     python pc98mount.py image.d88 -n game --mode flat     # Linux/WSL
 """
 
-import sys
 import os
 import threading
 from pathlib import Path
@@ -34,13 +33,18 @@ import logging
 import wx
 import wx.dataview as dv
 
+# ── Plugin infrastructure — must be imported before the domain
+#    modules so the registry is available when they self-register.
+import registry                                         # noqa: F401
+import plugin_loader
+
 from disk_image import open_image, create_blank_image, BLANK_GEOMETRIES, BLANK_FORMATS
-from fat_fs import FATFilesystem
 from hex_viewer import HexViewerPanel
 from mount_backend import (
-    MountManager, is_windows, is_wsl, _cached_is_wsl,
+    MountManager, is_windows,
     open_in_file_manager,
 )
+from plugin_manager import PluginManagerDialog
 
 logging.basicConfig(
     level=logging.INFO,
@@ -48,22 +52,36 @@ logging.basicConfig(
 )
 log = logging.getLogger("pc98mount")
 
+# Load all plugins (core + user) from the plugins/ directory.
+plugin_loader.load_plugins()
+
+if not registry.get_image_formats():
+    log.warning(
+        "No image formats registered!  Make sure plugins/core/ "
+        "contains pc98_formats.py and fat_filesystem.py."
+    )
+
+
 def _build_wildcard():
-    groups = [
-        ("PC-98 Disk Images",
-         ["d88", "d68", "d77", "hdm", "tfd", "fdi", "hdi", "img", "ima"]),
-        ("D88 Images",  ["d88", "d68", "d77"]),
-        ("HDM Images",  ["hdm", "tfd"]),
-        ("FDI Images",  ["fdi"]),
-        ("HDI Images",  ["hdi"]),
-        ("Raw Images",  ["img", "ima"]),
-        ("All Files",   ["*"]),
-    ]
-    parts = []
-    for label, exts in groups:
-        if exts == ["*"]:
-            parts.append("All Files (*.*)|*.*")
-            continue
+    """Build a file-dialog wildcard string from the plugin registry.
+
+    Includes one "All Supported" group, one group per registered
+    format, and a final "All Files" catch-all.  If no formats are
+    registered (shouldn't happen) it falls back to ``*.*``.
+    """
+    formats = registry.get_image_formats()
+
+    # Collect every known extension for the "all supported" group.
+    all_exts: list[str] = []
+    seen: set[str] = set()
+    for fmt in formats:
+        for ext in fmt.extensions:
+            bare = ext.lstrip('.')
+            if bare not in seen:
+                seen.add(bare)
+                all_exts.append(bare)
+
+    def _make_filter(label, exts):
         display_pats = [f"*.{e}" for e in exts]
         if is_windows():
             filter_pats = display_pats
@@ -75,7 +93,17 @@ def _build_wildcard():
                     filter_pats.append(f"*.{e.upper()}")
         display = ";".join(display_pats)
         filt = ";".join(filter_pats)
-        parts.append(f"{label} ({display})|{filt}")
+        return f"{label} ({display})|{filt}"
+
+    parts: list[str] = []
+    if all_exts:
+        parts.append(_make_filter("All Supported Images", all_exts))
+
+    for fmt in formats:
+        bare_exts = [e.lstrip('.') for e in fmt.extensions]
+        parts.append(_make_filter(fmt.group_label, bare_exts))
+
+    parts.append("All Files (*.*)|*.*")
     return "|".join(parts)
 
 
@@ -400,6 +428,7 @@ class BusyDialog(wx.Dialog):
         self.Show()
 
 
+
 # =============================================================================
 # Main Frame
 # =============================================================================
@@ -431,91 +460,85 @@ class PC98MountFrame(wx.Frame):
     # ── UI Construction ──────────────────────────────────────────────
 
     def _build_ui(self):
+        self._build_menu_bar()
+
         panel = wx.Panel(self)
         main_sizer = wx.BoxSizer(wx.VERTICAL)
 
-        # --- Toolbar row 1: file management ---
-        tb_sizer1 = wx.BoxSizer(wx.HORIZONTAL)
-
-        btn_add = wx.Button(panel, label="Add Image\u2026")
-        btn_add.Bind(wx.EVT_BUTTON, self._on_add_image)
-        tb_sizer1.Add(btn_add, 0, wx.RIGHT, 4)
-
-        btn_blank = wx.Button(panel, label="Blank Image\u2026")
-        btn_blank.SetToolTip(
-            "Create a new blank (empty) disk image"
-        )
-        btn_blank.Bind(wx.EVT_BUTTON, self._on_blank_image)
-        tb_sizer1.Add(btn_blank, 0, wx.RIGHT, 4)
-
-        btn_remove = wx.Button(panel, label="Remove")
-        btn_remove.Bind(wx.EVT_BUTTON, self._on_remove_image)
-        tb_sizer1.Add(btn_remove, 0, wx.RIGHT, 16)
-
-        # ── Update button ───────────────────────────────────
-        btn_update = wx.Button(panel, label="Update image\u2026")
-        btn_update.SetToolTip(
-            "Write changes from the mounted directory back into "
-            "the disk image"
-        )
-        btn_update.Bind(wx.EVT_BUTTON, self._on_update)
-        tb_sizer1.Add(btn_update, 0, wx.RIGHT, 4)
-
-        browse_label = ("Open in Explorer" if is_windows()
-                        else "Open in File Manager")
-        btn_browse = wx.Button(panel, label=browse_label)
-        btn_browse.Bind(wx.EVT_BUTTON, self._on_open_file_manager)
-        tb_sizer1.Add(btn_browse, 0)
-
-        main_sizer.Add(tb_sizer1, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, 6)
-
-        # --- Toolbar row 2: mount controls ---
-        tb_sizer2 = wx.BoxSizer(wx.HORIZONTAL)
+        # --- Mount controls bar (top) ---
+        mount_bar = wx.BoxSizer(wx.HORIZONTAL)
 
         lbl_target = "Drive:" if is_windows() else "Slot:"
-        tb_sizer2.Add(wx.StaticText(panel, label=lbl_target),
+        mount_bar.Add(wx.StaticText(panel, label=lbl_target),
                       0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
         self.target_combo = wx.ComboBox(
             panel, size=(100 if is_windows() else 110, -1),
             style=wx.CB_READONLY)
-        tb_sizer2.Add(self.target_combo, 0, wx.RIGHT, 4)
+        mount_bar.Add(self.target_combo, 0, wx.RIGHT, 4)
 
-        # Refresh button — Windows only (refreshes drive letters)
         if is_windows():
             btn_refresh = wx.Button(panel, label="\u21BB", size=(32, -1))
             btn_refresh.SetToolTip("Refresh available drive letters")
             btn_refresh.Bind(wx.EVT_BUTTON, self._on_refresh_targets)
-            tb_sizer2.Add(btn_refresh, 0, wx.RIGHT, 8)
+            mount_bar.Add(btn_refresh, 0, wx.RIGHT, 8)
 
-        tb_sizer2.Add(wx.StaticText(panel, label="Mode:"),
+        mount_bar.Add(wx.StaticText(panel, label="Mode:"),
                       0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
         self.mode_combo = wx.ComboBox(
             panel, choices=["fat", "flat", "sectors"],
             value="fat", size=(90, -1), style=wx.CB_READONLY)
-        tb_sizer2.Add(self.mode_combo, 0, wx.RIGHT, 8)
+        mount_bar.Add(self.mode_combo, 0, wx.RIGHT, 8)
 
         btn_mount = wx.Button(panel, label="Mount")
         btn_mount.Bind(wx.EVT_BUTTON, self._on_mount)
-        tb_sizer2.Add(btn_mount, 0, wx.RIGHT, 4)
+        mount_bar.Add(btn_mount, 0, wx.RIGHT, 4)
 
         btn_unmount = wx.Button(panel, label="Unmount")
         btn_unmount.Bind(wx.EVT_BUTTON, self._on_unmount)
-        tb_sizer2.Add(btn_unmount, 0)
+        mount_bar.Add(btn_unmount, 0)
 
-        main_sizer.Add(tb_sizer2, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 6)
+        main_sizer.Add(mount_bar, 0,
+                        wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, 6)
 
-        # --- Splitter: image list | notebook ---
+        # --- Splitter: left sidebar | notebook ---
         splitter = wx.SplitterWindow(
             panel, style=wx.SP_LIVE_UPDATE)
 
-        # Left: image list
+        # Left: image list + button grid below
         left_panel = wx.Panel(splitter)
         left_sizer = wx.BoxSizer(wx.VERTICAL)
+
         left_sizer.Add(wx.StaticText(left_panel, label="Disk Images"),
                         0, wx.BOTTOM, 4)
+
+        #  Image listbox (fills available space)
         self.image_listbox = wx.ListBox(left_panel)
         self.image_listbox.Bind(wx.EVT_LISTBOX, self._on_image_select)
         left_sizer.Add(self.image_listbox, 1, wx.EXPAND)
+
+        #  Button grid (3 columns, pinned to bottom)
+        btn_grid = wx.FlexGridSizer(cols=3, hgap=3, vgap=3)
+        btn_grid.AddGrowableCol(0)
+        btn_grid.AddGrowableCol(1)
+        btn_grid.AddGrowableCol(2)
+        for label, tip, handler in (
+            ("Add",          "Open one or more disk images",
+             self._on_add_image),
+            ("Remove",       "Remove the selected image",
+             self._on_remove_image),
+            ("Blank Image",  "Create a new blank disk image",
+             self._on_blank_image),
+            ("Update Image", "Write changes back into the image",
+             self._on_update),
+            ("Explorer",     "Open the mounted directory",
+             self._on_open_file_manager),
+        ):
+            btn = wx.Button(left_panel, label=label)
+            btn.SetToolTip(tip)
+            btn.Bind(wx.EVT_BUTTON, handler)
+            btn_grid.Add(btn, 0, wx.EXPAND)
+
+        left_sizer.Add(btn_grid, 0, wx.EXPAND | wx.TOP, 6)
         left_panel.SetSizer(left_sizer)
 
         # Right: notebook
@@ -530,9 +553,10 @@ class PC98MountFrame(wx.Frame):
         right_sizer.Add(self.notebook, 1, wx.EXPAND)
         right_panel.SetSizer(right_sizer)
 
-        splitter.SetMinimumPaneSize(120)
-        splitter.SplitVertically(left_panel, right_panel, 180)
-        main_sizer.Add(splitter, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, 6)
+        splitter.SetMinimumPaneSize(240)
+        splitter.SplitVertically(left_panel, right_panel, 280)
+        main_sizer.Add(splitter, 1,
+                        wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, 6)
 
         # --- Status bar ---
         self.status_bar = self.CreateStatusBar()
@@ -548,7 +572,9 @@ class PC98MountFrame(wx.Frame):
         self.notebook.AddPage(page, "  Files  ")
         sizer = wx.BoxSizer(wx.VERTICAL)
 
-        self.info_label = wx.StaticText(page, label="No image loaded")
+        self.info_label = wx.StaticText(
+            page, label="No image loaded",
+            style=wx.ST_ELLIPSIZE_END)
         sizer.Add(self.info_label, 0, wx.EXPAND | wx.BOTTOM, 4)
 
         btn_sizer = wx.BoxSizer(wx.HORIZONTAL)
@@ -595,6 +621,120 @@ class PC98MountFrame(wx.Frame):
         sizer.Add(self.detail_text, 1, wx.EXPAND)
 
         page.SetSizer(sizer)
+
+    # ── Menu Bar ────────────────────────────────────────────────────
+
+    def _build_menu_bar(self):
+        menu_bar = wx.MenuBar()
+
+        # ── File menu ────────────────────────────────────────────
+        file_menu = wx.Menu()
+        item_add = file_menu.Append(wx.ID_ANY, "Add Image\u2026\tCtrl+O")
+        item_remove = file_menu.Append(wx.ID_ANY, "Remove Image")
+        file_menu.AppendSeparator()
+        item_blank = file_menu.Append(
+            wx.ID_ANY, "Blank Image\u2026\tCtrl+N")
+        file_menu.AppendSeparator()
+        item_quit = file_menu.Append(wx.ID_EXIT, "Quit\tCtrl+Q")
+
+        self.Bind(wx.EVT_MENU, self._on_add_image, item_add)
+        self.Bind(wx.EVT_MENU, self._on_remove_image, item_remove)
+        self.Bind(wx.EVT_MENU, self._on_blank_image, item_blank)
+        self.Bind(wx.EVT_MENU, self._on_menu_quit, item_quit)
+
+        menu_bar.Append(file_menu, "&File")
+
+        # ── Plugins menu ─────────────────────────────────────────
+        plugins_menu = wx.Menu()
+        item_mgr = plugins_menu.Append(
+            wx.ID_ANY, "Plugin Manager\u2026\tCtrl+P")
+        plugins_menu.AppendSeparator()
+        item_install = plugins_menu.Append(
+            wx.ID_ANY, "Install Plugin\u2026")
+        item_open_dir = plugins_menu.Append(
+            wx.ID_ANY, "Open Plugin Folder")
+        plugins_menu.AppendSeparator()
+        item_reload = plugins_menu.Append(
+            wx.ID_ANY, "Reload All Plugins")
+
+        self.Bind(wx.EVT_MENU, self._on_plugin_manager, item_mgr)
+        self.Bind(wx.EVT_MENU, self._on_install_plugin, item_install)
+        self.Bind(wx.EVT_MENU, self._on_open_plugin_folder, item_open_dir)
+        self.Bind(wx.EVT_MENU, self._on_reload_all_plugins, item_reload)
+
+        menu_bar.Append(plugins_menu, "&Plugins")
+
+        # ── Help menu ────────────────────────────────────────────
+        help_menu = wx.Menu()
+        item_about = help_menu.Append(wx.ID_ABOUT, "About\u2026")
+        self.Bind(wx.EVT_MENU, self._on_about, item_about)
+        menu_bar.Append(help_menu, "&Help")
+
+        self.SetMenuBar(menu_bar)
+
+    # ── Menu event handlers ─────────────────────────────────────────
+
+    def _on_menu_quit(self, event):
+        self.Close()
+
+    def _on_about(self, event):
+        n_plugins = len(plugin_loader.get_loaded_plugins())
+        n_fmts = len(registry.get_image_formats())
+        n_det = len(registry.get_partition_detectors())
+        n_fs = len(registry.get_filesystem_probers())
+        wx.MessageBox(
+            "PC-98 Disk Image Mounter\n\n"
+            f"Loaded plugins: {n_plugins}\n"
+            f"Image formats:  {n_fmts}\n"
+            f"Partition detectors: {n_det}\n"
+            f"Filesystem probers: {n_fs}\n\n"
+            "Licensed under the MIT License.",
+            "About", wx.OK | wx.ICON_INFORMATION,
+        )
+
+    def _on_plugin_manager(self, event):
+        dlg = PluginManagerDialog(self)
+        dlg.CentreOnParent()
+        dlg.ShowModal()
+        changed = dlg.plugins_changed
+        dlg.Destroy()
+        if changed:
+            self._refresh_after_plugin_change()
+
+    def _on_install_plugin(self, event):
+        dlg = wx.FileDialog(
+            self, "Select Plugin File",
+            wildcard="Python files (*.py)|*.py",
+            style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST)
+        dlg.CentreOnParent()
+        if dlg.ShowModal() == wx.ID_OK:
+            path = dlg.GetPath()
+            info = plugin_loader.install_plugin_file(path)
+            if info:
+                self._set_status(
+                    f"Installed plugin: {info.display_name}")
+                self._refresh_after_plugin_change()
+            else:
+                wx.MessageBox(
+                    f"Failed to install plugin:\n{path}",
+                    "Plugin Error", wx.OK | wx.ICON_ERROR)
+        dlg.Destroy()
+
+    def _on_open_plugin_folder(self, event):
+        plugin_dir = plugin_loader.get_plugin_dir()
+        open_in_file_manager(str(plugin_dir))
+
+    def _on_reload_all_plugins(self, event):
+        loaded = plugin_loader.reload_all_plugins()
+        self._refresh_after_plugin_change()
+        self._set_status(
+            f"Reloaded plugins: {len(loaded)} loaded")
+
+    def _refresh_after_plugin_change(self):
+        """Rebuild the file-dialog wildcard after plugins change."""
+        global IMAGE_WILDCARD
+        IMAGE_WILDCARD = _build_wildcard()
+        log.info("File-dialog wildcard rebuilt after plugin change")
 
     # ── Helpers ──────────────────────────────────────────────────────
 
@@ -706,9 +846,9 @@ class PC98MountFrame(wx.Frame):
             disk = open_image(path)
             fs = None
             try:
-                fs = FATFilesystem(disk)
+                fs = registry.probe_filesystem(disk)
             except Exception as e:
-                log.info(f"No FAT filesystem: {e}")
+                log.info(f"No filesystem detected: {e}")
 
             label = ((fs.volume_label if fs and fs.volume_label else None)
                      or disk.label or Path(path).stem)
@@ -832,7 +972,7 @@ class PC98MountFrame(wx.Frame):
             f"File:            {info.path}",
             f"File Size:       {os.path.getsize(info.path):,} bytes",
             f"Image Type:      {info.disk.__class__.__name__}",
-            f"Label:           {info.label}",
+            f"Disk Label:      {info.disk.label}",
             f"Sector Size:     {info.disk.sector_size} bytes",
             f"Total Sectors:   {info.disk.total_sectors}",
             f"Total Size:      "
@@ -842,8 +982,17 @@ class PC98MountFrame(wx.Frame):
 
         if info.fs:
             fs = info.fs
+            # Show volume label with raw hex for debugging
+            vol = fs.volume_label or "(none)"
+            try:
+                raw = info.fs._read_fs_bytes(0x2B, 11)
+                vol_hex = ' '.join(f'{b:02X}' for b in raw)
+                vol_line = f"{vol}  [{vol_hex}]"
+            except Exception:
+                vol_line = vol
             lines += [
                 "\u2500\u2500 FAT Filesystem \u2500" * 3,
+                f"Volume Label:    {vol_line}",
                 f"FAT Type:        FAT{fs.fat_type}",
                 f"Bytes/Sector:    {fs.bytes_per_sector}",
                 f"Sects/Cluster:   {fs.sectors_per_cluster}",

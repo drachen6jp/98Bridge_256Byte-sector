@@ -10,16 +10,33 @@ Each detector reads the raw disk sectors and returns a list of
 filesystem layer (``fat_fs.py``) then probes each partition for a
 valid BPB.
 
+All built-in detectors self-register with the plugin registry when
+this module is imported.
+
 Adding a new scheme
 -------------------
 1. Write a ``detect_<scheme>(disk_image)`` function that returns a
    list of ``PartitionEntry``.
-2. Register it in ``DETECTORS`` at the bottom of this file.
+2. Register it::
+
+       from registry import register_partition_detector
+       register_partition_detector('MyScheme', detect_my_scheme, priority=50)
+
+   Or use the decorator::
+
+       from registry import partition_detector
+
+       @partition_detector('MyScheme', priority=50)
+       def detect_my_scheme(disk_image):
+           ...
+
 3. ``detect_partitions()`` will call it automatically.
 """
 
 import struct
 import logging
+
+from registry import get_partition_detectors
 
 log = logging.getLogger("pc98mount.partition")
 
@@ -260,30 +277,26 @@ def _pc98_cylinder1_fallback(disk_image, spt, heads):
 
 # ── Public API ──────────────────────────────────────────────────
 
-# Detectors are tried in order; the first one that returns a
-# non-empty list wins.
-DETECTORS = [
-    ("MBR",   detect_mbr),
-    ("PC-98", detect_pc98),
-]
-
-
 def detect_partitions(disk_image):
     """Auto-detect the partition scheme and return all partitions.
+
+    Iterates over all registered detectors (from the plugin registry)
+    in priority order.  The first one that returns a non-empty list
+    wins.
 
     Returns a list of ``PartitionEntry`` objects.  If no partition
     table is recognised the list is empty (the image is likely an
     unpartitioned floppy or a raw dump).
     """
-    for name, detector in DETECTORS:
+    for entry in get_partition_detectors():
         try:
-            parts = detector(disk_image)
+            parts = entry.detector(disk_image)
             if parts:
                 log.info(
-                    f"Partition scheme: {name} "
+                    f"Partition scheme: {entry.name} "
                     f"({len(parts)} partition(s))"
                 )
                 return parts
         except Exception as exc:
-            log.warning(f"{name} detection failed: {exc}")
+            log.warning(f"{entry.name} detection failed: {exc}")
     return []

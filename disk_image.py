@@ -5,12 +5,18 @@ Provides uniform sector-level access regardless of container format.
 
 Write support: each format implements write_sector() and save() so that
 modifications can be flushed back to disk.
+
+All built-in formats self-register with the plugin registry when this
+module is imported.  Third-party formats can be added by writing a
+plugin — see ``registry.py`` and ``plugins/example_plugin.py``.
 """
 
 import struct
 import os
 import shutil
 import logging
+
+import registry as _registry
 
 log = logging.getLogger("pc98mount.disk")
 
@@ -339,21 +345,12 @@ class HDIImage(DiskImage):
 
 
 def open_image(path):
-    """Auto-detect image format and return appropriate DiskImage instance."""
-    ext = path.lower()
+    """Auto-detect image format and return appropriate DiskImage instance.
 
-    if ext.endswith('.d88') or ext.endswith('.d68') or ext.endswith('.d77'):
-        return D88Image(path)
-    elif ext.endswith('.fdi'):
-        return FDIImage(path)
-    elif ext.endswith('.hdi'):
-        return HDIImage(path)
-    elif ext.endswith('.hdm') or ext.endswith('.tfd'):
-        return RawImage(path, sector_size=1024)
-    elif ext.endswith('.img') or ext.endswith('.ima'):
-        return RawImage(path)
-    else:
-        return RawImage(path)
+    Delegates to the plugin registry.  Kept here for backward-compatibility
+    with code that does ``from disk_image import open_image``.
+    """
+    return _registry.open_image(path)
 
 
 # =============================================================================

@@ -310,9 +310,23 @@ class FATFilesystem:
 
         self.volume_label = ""
         try:
-            self.volume_label = boot[0x2B:0x36].decode(
-                'shift_jis', errors='replace'
-            ).rstrip().rstrip('\x00')
+            raw = boot[0x2B:0x36]
+            # Reject the BPB label field if the raw bytes look like
+            # executable code rather than text.  On PC-98 HDD images,
+            # offset 0x2B often contains IPL boot code, not a label.
+            # Real labels are printable ASCII/Shift-JIS with no nulls
+            # or control characters (except trailing 0x20 padding).
+            has_nulls = b'\x00' in raw.rstrip(b'\x20')
+            has_control = any(b < 0x20 for b in raw.rstrip(b'\x20'))
+            if not has_nulls and not has_control and raw.rstrip() != b'':
+                decoded = raw.decode(
+                    'shift_jis', errors='replace'
+                ).rstrip().rstrip('\x00')
+                clean = ''.join(
+                    c for c in decoded
+                    if c.isprintable() and c != '\ufffd'
+                ).strip()
+                self.volume_label = clean
         except Exception:
             pass
 

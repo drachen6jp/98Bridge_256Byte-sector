@@ -29,7 +29,6 @@ import subprocess
 import tempfile
 import time
 import logging
-from pathlib import Path
 
 log = logging.getLogger("pc98mount.mount")
 

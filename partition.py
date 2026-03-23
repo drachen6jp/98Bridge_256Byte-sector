@@ -174,7 +174,7 @@ def detect_pc98(disk_image):
 
     # Read sector 1 which holds the partition table.
     sec1 = disk_image.read_sector(1)
-    if len(sec1) < 512:
+    if len(sec1) < 256:
         return []
 
     # Determine disk geometry for CHS → LBA conversion.

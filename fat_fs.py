@@ -342,6 +342,33 @@ class FATFilesystem:
         self._validate_fat_header()
 
     def _apply_geometry_fallback(self):
+        sec4 = self.disk.read_sector(4)
+        oldstyle = (
+		sec4[0:16] == b'MS-DOS INF AREA '
+       )
+        if oldstyle:
+             log.warning("No geometry match — using default PC-98 old style")
+             bps = 256 
+             self.bytes_per_sector = bps
+             self.sectors_per_cluster = sec4[0x12]
+             self.reserved_sectors = sec4[0x13] + sec4[0x1a] + 9
+             self.num_fats = sec4[0x15]
+             self.root_entry_count =sec4[0x16] + sec4[0x17]*0x100
+             self.fat_size_16 = 1
+             self.media_descriptor = 0xfe
+             self.total_sectors = sec4[0x18] + sec4[0x19] * 0x100
+             if sec4[0x1e] > 5:
+                 self.fat_size_16 = 2
+                 self.reserved_sectors = sec4[0x13] + sec4[0x1a] + 0xf
+             if sec4[0x1e] > 11:
+                 self.fat_size_16 = 3
+                 self.reserved_sectors = sec4[0x13] + sec4[0x1a] + 0x15
+             if sec4[0x1e] > 15:
+                 self.fat_size_16 = 4
+                 self.reserved_sectors = sec4[0x13] + sec4[0x1a] + 0x1b
+             return
+
+
         for (geo_bytes, geo_bps, geo_spc, geo_res, geo_nfats,
              geo_root, geo_fat, geo_total, geo_media) in PC98_KNOWN_GEOMETRIES:
             if abs(self._image_total_bytes - geo_bytes) < 4096:
@@ -366,9 +393,10 @@ class FATFilesystem:
         self.reserved_sectors = 1
         self.num_fats = 2
         self.root_entry_count = 192
-        self.fat_size_16 = 2
+        self.fat_size_16 = 1
         self.media_descriptor = 0xFE
         self.total_sectors = self._image_total_bytes // bps
+
 
     def _validate_fat_header(self):
         try:
@@ -656,6 +684,7 @@ class FATFilesystem:
     def _build_fat_bytes(self, fat_table):
         """Serialise the in-memory *fat_table* list to on-disk bytes."""
         fat_bytes_len = self.fat_size_16 * self.bytes_per_sector
+
         buf = bytearray(fat_bytes_len)
 
         if self.fat_type == 12:

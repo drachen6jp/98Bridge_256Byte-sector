@@ -393,7 +393,7 @@ class FATFilesystem:
         self.reserved_sectors = 1
         self.num_fats = 2
         self.root_entry_count = 192
-        self.fat_size_16 = 1
+        self.fat_size_16 = 2
         self.media_descriptor = 0xFE
         self.total_sectors = self._image_total_bytes // bps
 

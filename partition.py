@@ -164,10 +164,18 @@ def detect_pc98(disk_image):
         or (len(boot) >= 0x100
             and boot[0xFE] == 0x55 and boot[0xFF] == 0xAA)
     )
+
     if not is_pc98:
-        return []
+       return []
 
     log.info("PC-98 IPL detected")
+
+    oldformat  = 0
+    if len(boot) == 256:
+       sec4 = disk_image.read_sector(4)
+       oldformat = (
+		sec4[0:16] == b'MS-DOS INF AREA '
+       )
 
     ds = disk_image.sector_size
     image_bytes = disk_image.total_sectors * ds
@@ -182,6 +190,25 @@ def detect_pc98(disk_image):
     heads = getattr(disk_image, '_heads', 0) or 8
 
     partitions = []
+
+    if oldformat:
+           log.info("PC-98 Old style IPL detected")
+           start_head = 0
+           start_sec = sec4[0x1a]
+           start_cyl = 0
+           lba_start = start_sec
+           lba_end = sec4[0x17]*1024 //ds
+           byte_offset = lba_start * ds
+           byte_size = (lba_end - lba_start + 1) * ds if lba_end > lba_start else 0
+           partitions.append(PartitionEntry(
+            index=0,
+            scheme="PC-98",
+            type_id=0,
+            name="MS-DOS INF AREA ",
+            byte_offset=byte_offset,
+            byte_size=byte_size,
+              ))
+
     for i in range(16):
         off = i * 32
         entry = sec1[off:off + 32]

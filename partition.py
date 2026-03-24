@@ -160,7 +160,7 @@ def detect_pc98(disk_image):
         return []
 
     is_pc98 = (
-        boot[3:7] == b'IPL1'
+        boot[4:8] == b'IPL1'
         or (len(boot) >= 0x100
             and boot[0xFE] == 0x55 and boot[0xFF] == 0xAA)
     )

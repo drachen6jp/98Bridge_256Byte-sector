@@ -71,7 +71,7 @@ class IPL1Image(DiskImage):
         self._data[offset:end] = data[:self._sector_size]
 
 register_image_format(
-    extensions=['.vhd', '.img'],
+    extensions=['.vhd'],
     opener=IPL1Image,
     label='Raw (IPL1type HDD)',
     group_label='Raw(IPL1) Images',

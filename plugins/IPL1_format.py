@@ -23,7 +23,7 @@ import logging
 from disk_image import DiskImage
 from registry import register_image_format
 
-log = logging.getLogger("pc98mount.plugin.nhd")
+log = logging.getLogger("pc98mount.plugin.IPL1")
 
 
 # =====================================================================
@@ -38,10 +38,10 @@ class IPL1Image(DiskImage):
         spt   = self._data[0x2]
 
         raw_len = len(self._data)
-        if raw_len < 0x110000000 and (heads == 0 or spt == 0) or (heads == 0x90 and spt == 0x90):
+        if raw_len < 0x110000000 and ((heads == 0 or spt == 0) or (heads == 0x90 and spt == 0x90)):
             heads = 8
             spt = 17
-        if raw_len >= 0x110000000 and (heads == 0 or spt == 0) or (heads == 0x90 and spt == 0x90):
+        if raw_len >= 0x110000000 and ((heads == 0 or spt == 0) or (heads == 0x90 and spt == 0x90)):
             heads = 16
             spt = 63
         cyls  = raw_len // (heads * spt * self._sector_size)
@@ -71,7 +71,7 @@ class IPL1Image(DiskImage):
         self._data[offset:end] = data[:self._sector_size]
 
 register_image_format(
-    extensions=['.vhd'],
+    extensions=['.vhd', '.img'],
     opener=IPL1Image,
     label='Raw (IPL1type HDD)',
     group_label='Raw(IPL1) Images',

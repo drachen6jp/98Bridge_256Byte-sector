@@ -166,7 +166,7 @@ def detect_pc98(disk_image):
     )
 
     if not is_pc98:
-       return []
+        return []
 
     log.info("PC-98 IPL detected")
 

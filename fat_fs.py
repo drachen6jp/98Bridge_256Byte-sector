@@ -397,7 +397,6 @@ class FATFilesystem:
         self.media_descriptor = 0xFE
         self.total_sectors = self._image_total_bytes // bps
 
-
     def _validate_fat_header(self):
         try:
             fat_data = self._read_fs_sectors(self.first_fat_sector, 1)
@@ -684,7 +683,6 @@ class FATFilesystem:
     def _build_fat_bytes(self, fat_table):
         """Serialise the in-memory *fat_table* list to on-disk bytes."""
         fat_bytes_len = self.fat_size_16 * self.bytes_per_sector
-
         buf = bytearray(fat_bytes_len)
 
         if self.fat_type == 12:

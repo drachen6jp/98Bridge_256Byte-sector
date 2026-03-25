@@ -196,7 +196,7 @@ def detect_pc98(disk_image):
            start_sec = sec4[0x1a]
            start_cyl = 0
            lba_start = start_sec
-           lba_end = sec4[0x17]*1024 //ds
+           lba_end = (sec4[0x18] + sec4[0x19]*0x100)*1024 //ds
            byte_offset = lba_start * ds
            byte_size = (lba_end - lba_start + 1) * ds if lba_end > lba_start else 0
            partitions.append(PartitionEntry(

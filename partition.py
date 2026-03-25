@@ -164,7 +164,6 @@ def detect_pc98(disk_image):
         or (len(boot) >= 0x100
             and boot[0xFE] == 0x55 and boot[0xFF] == 0xAA)
     )
-
     if not is_pc98:
         return []
 
